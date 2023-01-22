@@ -68,6 +68,14 @@ class Packet:
                 return string
             string += ch
 
+    def write_byte(self, val: int):
+        self.data.write(struct.pack("<B", val))
+        self.length += 1
+
+    def write_short(self, val: int):
+        self.data.write(struct.pack("<h", val))
+        self.length += 2
+
     def write_long(self, val: int):
         self.data.write(struct.pack("<i", val))
         self.length += 4

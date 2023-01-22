@@ -18,6 +18,7 @@
 #
 # -----------------------------------------------------------------------------
 
+import csv
 import ipaddress
 import logging
 import random
@@ -25,21 +26,25 @@ import selectors
 import socket
 import time
 import weakref
-from odameta import Address, Packet, PacketException, Server, Player
+
+from odameta.server import *
+from odameta.packet import *
+
 from typing import Dict, List, Optional, cast
 
 METAPORT = 15000
+METALATEST = "latest.csv"
 SERVER_CHALLENGE = 5560020  # doomsv challenge
 LAUNCHER_CHALLENGE = 777123  # csdl challenge
 
 MAX_SERVERS = 1024
 MAX_SERVERS_PER_IP = 64
-MAX_SERVER_AGE = 60.0  # 300.0 # 5 minutes
-MAX_UNVERIFIED_SERVER_AGE = 30.0  # 60.0 # 60 seconds
+MAX_SERVER_AGE = 300.0  # 5 minutes
+MAX_UNVERIFIED_SERVER_AGE = 60.0  # 60 seconds
 
 _meta_socket: Optional[socket.socket] = None
 server_list: Dict[str, Server] = {}
-server_addresses: Dict[str, weakref.WeakValueDictionary] = {}
+server_addresses: Dict[str, weakref.WeakValueDictionary[int, Server]] = {}
 
 
 def meta_socket() -> socket.socket:
@@ -56,12 +61,12 @@ def address_str(addr: Address) -> str:
     return f"{addr[0]}:{addr[1]}"
 
 
-def send_packet(packet: Packet, addr: Address):
+def send_packet(packet: Packet, addr: Address) -> None:
     """Send a packet to a remote address."""
     meta_socket().sendto(packet.data.getbuffer(), addr)
 
 
-def server_add(server: Server):
+def server_add(server: Server) -> None:
     """Add server to all server lists."""
     addr = server.addr
     server_list[address_str(addr)] = server
@@ -72,7 +77,7 @@ def server_add(server: Server):
         ports[addr[1]] = server
 
 
-def server_remove(server: Server):
+def server_remove(server: Server) -> None:
     """Remove server from all server lists."""
     addr = server.addr
     del server_list[address_str(addr)]
@@ -85,7 +90,7 @@ def server_get(addr: Address) -> Optional[Server]:
     """Get a server from the list by address."""
     ports = server_addresses.get(addr[0])
     if not ports is None:
-        server = cast(Optional[Server], ports.get(addr[1]))
+        server = ports.get(addr[1])
         if not server is None:
             return server
     return None
@@ -99,7 +104,7 @@ def ip_reached_limit(ip: str) -> bool:
     return len(ports) >= MAX_SERVERS_PER_IP
 
 
-def add_server(addr: Address):
+def add_server(addr: Address) -> None:
     """Add a server to the server list from an initial contact."""
     # Check for existing address:port combination
     server = server_get(addr)
@@ -127,7 +132,7 @@ def add_server(addr: Address):
         logging.warn(f"Failed to add server: {address_str(addr)}, no slots left")
 
 
-def add_server_info(packet: Packet, addr: Address):
+def add_server_info(packet: Packet, addr: Address) -> None:
     """Add detailed information for a server."""
     server = server_get(addr)
     if server is None:
@@ -156,27 +161,33 @@ def add_server_info(packet: Packet, addr: Address):
     server.verified = True
     server.age = time.monotonic()
 
-    server.hostname = packet.read_string()
+    server.hostname = packet.read_string().decode(encoding="ascii", errors="ignore")
     server.curplayers = packet.read_byte()
     server.maxplayers = packet.read_byte()
-    server.map = packet.read_string()
+    server.map = packet.read_string().decode(encoding="ascii", errors="ignore")
 
     pwad_count = packet.read_byte()
+    server.pwads.clear()
     for _ in range(pwad_count):
-        server.pwads.append(packet.read_string())
+        server.pwads.append(
+            packet.read_string().decode(encoding="ascii", errors="ignore")
+        )
 
     server.gametype = packet.read_byte()
     server.skill = packet.read_byte()
     server.teamplay = packet.read_byte()
     server.ctfmode = packet.read_byte()
 
+    server.players.clear()
     for _ in range(server.curplayers):
         player = Player()
 
-        player.names = packet.read_string()
+        player.names = packet.read_string().decode(encoding="ascii", errors="ignore")
         player.frags = packet.read_short()
         player.ping = packet.read_long()
         player.team = packet.read_byte()
+
+        server.players.append(player)
 
 
 def cull_servers() -> None:
@@ -202,67 +213,41 @@ def cull_servers() -> None:
         server_remove(server)
 
 
-# void dumpServersToFile(const char *file = "./latest")
-# {
-# 	static bool file_error = false;
-# 	FILE *fp = fopen(file, "w");
+def dump_servers_to_file() -> None:
+    "Dump current list of servers to a file in CSV format."
+    with open(METALATEST, "w", newline="") as fp:
+        csvp = csv.writer(fp)
+        csvp.writerow(
+            ["Name", "Map", "Players/Max", "WADs", "Gametype", "Address:Port"]
+        )
 
-# 	if(!fp)
-# 	{
-# 		if(!file_error)
-# 			printf("error opening file %s for writing\n", file);
-# 		file_error = true;
-# 		return;
-# 	}
+        for server in server_list.values():
+            if server.verified == False:
+                continue
 
-# 	file_error = false;
+            gametype = "UNKNOWN"
+            if server.gametype == 0:
+                gametype = "COOP"
+            else:
+                gametype = "DM"
+            if server.gametype == 1 and server.teamplay == 1:
+                gametype = "TEAM DM"
+            if server.ctfmode == 1:
+                gametype = "CTF"
 
-# 	list<SServer>::iterator itr;
-
-# 	itr = servers.begin();
-
-# 	fprintf(fp, "\"Name\",\"Map\",\"Players/Max\",\"WADs\",\"Gametype\",\"Address:Port\"\n");
-
-# 	int i = 0;
-
-# 	while (itr != servers.end())
-# 	{
-# 		if(!(*itr).verified)
-# 		{
-# 			++itr;
-# 			continue;
-# 		}
-
-#         string detectgametype = "ERROR";
-# 		if((*itr).gametype == 0)
-# 			detectgametype = "COOP";
-# 		else
-# 			detectgametype = "DM";
-# 		if((*itr).gametype == 1 && (*itr).teamplay == 1)
-# 			detectgametype = "TEAM DM";
-# 		if((*itr).ctfmode == 1)
-# 			detectgametype = "CTF";
-
-# 		string str_wads;
-# 		for(size_t j = 0; j < (*itr).pwads.size(); j++)
-# 		{
-# 			str_wads += (*itr).pwads[j];
-# 			str_wads += " ";
-# 		}
-# 		if(!str_wads.length())
-# 			str_wads = " ";
-
-# 		fprintf(fp, "\"%s\",\"%s\",\"%d/%d\",\"%s\",\"%s\",\"%s\"\n", (*itr).hostname.c_str(), (*itr).map.c_str(), (*itr).players, (*itr).maxplayers, str_wads.c_str(), detectgametype.c_str(), NET_AdrToString((*itr).addr, true));
-
-# 		i++;
-# 		++itr;
-# 	}
-
-#     fclose(fp);
-# }
+            csvp.writerow(
+                [
+                    server.hostname,
+                    server.map,
+                    f"{len(server.players)}/{server.maxplayers}",
+                    " ".join(server.pwads),
+                    gametype,
+                    address_str(server.addr),
+                ]
+            )
 
 
-def write_server_data(packet: Packet):
+def write_server_data(packet: Packet) -> None:
     """Write out server data to a packet."""
     verified_count = 0
     for server in server_list.values():
@@ -275,11 +260,12 @@ def write_server_data(packet: Packet):
             continue
 
         ip = ipaddress.ip_address(server.addr[0])
-        packet.write_bytes(ip.packed)
+        for octet in range(4):
+            packet.write_byte(ip.packed[octet])
         packet.write_short(server.addr[1])
 
 
-def send_server_data(addr: Address):
+def send_server_data(addr: Address) -> None:
     """Send out (possibly cached) launcher challenge."""
     packet = Packet()
     packet.write_long(LAUNCHER_CHALLENGE)
@@ -287,7 +273,7 @@ def send_server_data(addr: Address):
     send_packet(packet, addr)
 
 
-def ping_servers():
+def ping_servers() -> None:
     """Ping all servers, so we can verify their presence."""
     for server in server_list.values():
         if server.pinged and not server.verified:
@@ -305,7 +291,7 @@ def ping_servers():
         logging.debug(f"pinging {address_str(server.addr)}")
 
 
-def get_packet(sock: socket.socket):
+def get_packet(sock: socket.socket) -> None:
     """Read a packet sent to the metaserver."""
     try:
         data, address = sock.recvfrom(65535)
@@ -346,7 +332,7 @@ def get_packet(sock: socket.socket):
         # logging.debug(f"discarded invalid packet from address:{address_str(address)}")
 
 
-def main():
+def main() -> None:
     sel = selectors.DefaultSelector()
     sel.register(meta_socket(), selectors.EVENT_READ, get_packet)
 
@@ -365,6 +351,7 @@ def main():
 
         current_time = time.monotonic()
         if current_time > next_ping:
+            dump_servers_to_file()
             ping_servers()
             next_ping = time.monotonic() + 5.0  # every 5 seconds
 
