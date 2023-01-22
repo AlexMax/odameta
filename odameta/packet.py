@@ -21,7 +21,7 @@
 import inspect
 import io
 import struct
-from typing import Optional
+from typing import Optional, Tuple, cast
 
 
 class Packet:
@@ -39,21 +39,21 @@ class Packet:
     def read_byte(self) -> int:
         data = self.data.read(1)
         if len(data) == 1:
-            return struct.unpack("B", data)[0]
+            return cast(Tuple[int], struct.unpack("B", data))[0]
         else:
             raise PacketException(self)
 
     def read_short(self) -> int:
         data = self.data.read(2)
         if len(data) == 2:
-            return struct.unpack("<h", data)[0]
+            return cast(Tuple[int], struct.unpack("<h", data))[0]
         else:
             raise PacketException(self)
 
     def read_long(self) -> int:
         data = self.data.read(4)
         if len(data) == 4:
-            return struct.unpack("<i", data)[0]
+            return cast(Tuple[int], struct.unpack("<i", data))[0]
         else:
             raise PacketException(self)
 
@@ -68,15 +68,15 @@ class Packet:
                 return string
             string += ch
 
-    def write_byte(self, val: int):
+    def write_byte(self, val: int) -> None:
         self.data.write(struct.pack("<B", val))
         self.length += 1
 
-    def write_short(self, val: int):
+    def write_short(self, val: int) -> None:
         self.data.write(struct.pack("<h", val))
         self.length += 2
 
-    def write_long(self, val: int):
+    def write_long(self, val: int) -> None:
         self.data.write(struct.pack("<i", val))
         self.length += 4
 
