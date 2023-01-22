@@ -25,26 +25,22 @@ import random
 import selectors
 import socket
 import time
-import weakref
+from typing import List, Optional
 
 from odameta.server import *
 from odameta.packet import *
-
-from typing import Dict, List, Optional, cast
+from odameta.list import *
 
 METAPORT = 15000
 METALATEST = "latest.csv"
 SERVER_CHALLENGE = 5560020  # doomsv challenge
 LAUNCHER_CHALLENGE = 777123  # csdl challenge
 
-MAX_SERVERS = 1024
-MAX_SERVERS_PER_IP = 64
 MAX_SERVER_AGE = 300.0  # 5 minutes
 MAX_UNVERIFIED_SERVER_AGE = 60.0  # 60 seconds
 
 _meta_socket: Optional[socket.socket] = None
-server_list: Dict[str, Server] = {}
-server_addresses: Dict[str, weakref.WeakValueDictionary[int, Server]] = {}
+meta_list = ServerList()
 
 
 def meta_socket() -> socket.socket:
@@ -56,58 +52,15 @@ def meta_socket() -> socket.socket:
     return _meta_socket
 
 
-def address_str(addr: Address) -> str:
-    """Turn an address into a string representation."""
-    return f"{addr[0]}:{addr[1]}"
-
-
 def send_packet(packet: Packet, addr: Address) -> None:
     """Send a packet to a remote address."""
     meta_socket().sendto(packet.data.getbuffer(), addr)
 
 
-def server_add(server: Server) -> None:
-    """Add server to all server lists."""
-    addr = server.addr
-    server_list[address_str(addr)] = server
-    ports = server_addresses.get(addr[0])
-    if ports is None:
-        server_addresses[addr[0]] = weakref.WeakValueDictionary({addr[1]: server})
-    else:
-        ports[addr[1]] = server
-
-
-def server_remove(server: Server) -> None:
-    """Remove server from all server lists."""
-    addr = server.addr
-    del server_list[address_str(addr)]
-    ports = server_addresses.get(addr[0])
-    if not ports is None and len(ports) == 0:
-        del server_addresses[addr[0]]
-
-
-def server_get(addr: Address) -> Optional[Server]:
-    """Get a server from the list by address."""
-    ports = server_addresses.get(addr[0])
-    if not ports is None:
-        server = ports.get(addr[1])
-        if not server is None:
-            return server
-    return None
-
-
-def ip_reached_limit(ip: str) -> bool:
-    """Return True if no more servers can be added for this IP."""
-    ports = server_addresses.get(ip)
-    if ports is None:
-        return False
-    return len(ports) >= MAX_SERVERS_PER_IP
-
-
 def add_server(addr: Address) -> None:
     """Add a server to the server list from an initial contact."""
     # Check for existing address:port combination
-    server = server_get(addr)
+    server = meta_list.get(addr)
     if not server is None:
         # Found existing server, reset the age
         server.age = time.monotonic()
@@ -115,26 +68,24 @@ def add_server(addr: Address) -> None:
         logging.debug(f"refreshed address:{address_str(server.addr)}")
         return
 
-    if len(server_list) < MAX_SERVERS:
-        if ip_reached_limit(addr[0]):
+    if not meta_list.servers_reached_limit():
+        if meta_list.ip_reached_limit(addr[0]):
             logging.debug(f"too many servers for address:{address_str(addr)}")
             return
 
         server = Server(addr=addr)
         server.age = time.monotonic()
 
-        server_add(server)
+        meta_list.add(server)
 
-        logging.info(
-            f"Server registered: {address_str(addr)}, {len(server_list)} total."
-        )
+        logging.info(f"Server registered: {address_str(addr)}, {len(meta_list)} total.")
     else:
         logging.warn(f"Failed to add server: {address_str(addr)}, no slots left")
 
 
 def add_server_info(packet: Packet, addr: Address) -> None:
     """Add detailed information for a server."""
-    server = server_get(addr)
+    server = meta_list.get(addr)
     if server is None:
         logging.debug(f"got info from alien server at address: {address_str(addr)}")
         return
@@ -152,7 +103,7 @@ def add_server_info(packet: Packet, addr: Address) -> None:
         )
         return
 
-    if ip_reached_limit(addr[0]):
+    if meta_list.ip_reached_limit(addr[0]):
         logging.debug(f"too many servers from ip: {addr[0]}")
         return
 
@@ -195,22 +146,22 @@ def cull_servers() -> None:
 
     to_cull: List[Server] = []
 
-    for server in server_list.values():
+    for server in meta_list.values():
         if server.verified is True:
             if time.monotonic() - server.age > MAX_SERVER_AGE:
                 to_cull.append(server)
                 logging.info(
-                    f"Remote server timed out at {address_str(server.addr)}, {len(server_list)} total."
+                    f"Remote server timed out at {address_str(server.addr)}, {len(meta_list)} total."
                 )
         else:
             if time.monotonic() - server.age > MAX_UNVERIFIED_SERVER_AGE:
                 to_cull.append(server)
                 logging.info(
-                    f"Unverified remote server timed out at {address_str(server.addr)}, {len(server_list)} total."
+                    f"Unverified remote server timed out at {address_str(server.addr)}, {len(meta_list)} total."
                 )
 
     for server in to_cull:
-        server_remove(server)
+        meta_list.remove(server)
 
 
 def dump_servers_to_file() -> None:
@@ -221,7 +172,7 @@ def dump_servers_to_file() -> None:
             ["Name", "Map", "Players/Max", "WADs", "Gametype", "Address:Port"]
         )
 
-        for server in server_list.values():
+        for server in meta_list.values():
             if server.verified == False:
                 continue
 
@@ -250,12 +201,12 @@ def dump_servers_to_file() -> None:
 def write_server_data(packet: Packet) -> None:
     """Write out server data to a packet."""
     verified_count = 0
-    for server in server_list.values():
+    for server in meta_list.values():
         if server.verified:
             verified_count += 1
     packet.write_short(verified_count)
 
-    for server in server_list.values():
+    for server in meta_list.values():
         if not server.verified:
             continue
 
@@ -275,7 +226,7 @@ def send_server_data(addr: Address) -> None:
 
 def ping_servers() -> None:
     """Ping all servers, so we can verify their presence."""
-    for server in server_list.values():
+    for server in meta_list.values():
         if server.pinged and not server.verified:
             continue  # have already asked and got no answer
 

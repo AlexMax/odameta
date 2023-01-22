@@ -24,6 +24,11 @@ from typing import List, Tuple
 Address = Tuple[str, int]
 
 
+def address_str(addr: Address) -> str:
+    """Turn an address into a string representation."""
+    return f"{addr[0]}:{addr[1]}"
+
+
 @dataclass
 class Player:
     names: str = ""
